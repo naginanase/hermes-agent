@@ -1083,6 +1083,12 @@ def _render_responses_citations(text: str, annotations: List[Dict[str, Any]]) ->
             if link not in unlocated:
                 unlocated.append(link)
             continue
+        # Some native backends already render a Markdown link in the cited span.
+        # Keep that verified link instead of appending the same source again.
+        source_span = text[start:end]
+        destinations = "|".join(re.escape(value) for value in {url, destination})
+        if re.search(r"(?<!!)\[[^\]\n]+\]\(<?(?:" + destinations + r")>?\)", source_span):
+            continue
         # Source ranges over prose become insertions at their original end offset.
         # Only a whole native marker is replaced; this also makes overlapping
         # prose ranges safe because earlier offsets never see already-inserted links.

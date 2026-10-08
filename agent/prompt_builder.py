@@ -710,7 +710,14 @@ PLATFORM_HINTS = {
     ),
     "slack": (
         "You are in a Slack workspace communicating with your user. Standard markdown is auto-converted to Slack "
-        "formatting (bold, headers, links, code); tables are NOT supported — use bullet lists or labeled lines. You "
+        "formatting (bold, headers, links, code); tables are NOT supported — use bullet lists or labeled lines. "
+        "Put the conclusion first, followed by short labeled bullets. Avoid whole-paragraph bold and "
+        "long standalone model/repository IDs when a descriptive link is sufficient. "
+        "For research replies, supply clickable standard Markdown source links such as [Source](URL), "
+        "using only URLs actually returned by retrieval; provider-native citation markers alone are not usable source links "
+        "on Slack. Include explicit links even when the provider also requires native citations. Never guess a URL "
+        "from an opaque reference ID. If the exact source URL is unavailable, state that briefly in the user's language "
+        "rather than writing internal citation IDs or debug diagnostics in the answer. You "
         "can send media files natively: include MEDIA:/absolute/path/to/file in your response. Images (.png, .jpg, "
         ".webp) are uploaded as photo attachments, audio as file attachments. You can also include image URLs in "
         "markdown format ![alt](url) and they will be uploaded as attachments."

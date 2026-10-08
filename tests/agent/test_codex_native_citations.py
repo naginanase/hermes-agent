@@ -87,6 +87,16 @@ def test_annotated_delta_only_stream_preserves_refusal_text():
     assert message.codex_message_items[0]["content"][1]["text"] == refusal
 
 
+def test_annotated_source_already_linked_in_its_span_is_not_duplicated():
+    url = "https://example.org/source"
+    text = f"Claim.([example.org]({url}))"
+    annotation = dict(type="url_citation", start_index=text.index("(["), end_index=len(text),
+                      title="Source", url=url)
+    message, _ = _normalize_codex_response(response_with(text, [annotation]))
+    assert message.content == text
+    assert message.codex_message_items[0]["content"][0]["annotations"] == [annotation]
+
+
 def test_annotation_span_over_prose_does_not_erase_the_claim():
     annotation = dict(type="url_citation", start_index=0, end_index=5,
                       title="Source", url="https://example.org/source")
