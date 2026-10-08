@@ -3156,23 +3156,26 @@ class SlackAdapter(BasePlatformAdapter):
 
     def format_message(self, content: str) -> str:
         """Convert standard markdown to Slack mrkdwn.
-        Tables are fenced first; code is protected from later passes; broadcast mentions are escaped
-        before entity protection so output can't ping @channel."""
+        Tables/code/entities are protected before punctuation escapes; broadcast
+        mentions are escaped during entity protection so output can't ping @channel."""
         if not content:
             return content
         content = _wrap_markdown_tables(content)
         placeholders: dict = {}
+        url_escapes: dict = {}
         counter = [0]
+        punctuation_escape = r"\\([!\"#$%&'()*+,\-./:;<=>?@\[\]\\^_`{|}~])"
 
-        def _ph(value: str) -> str:
+        def _ph(value: str, *, url_value: Optional[str] = None) -> str:
             """Stash value behind a placeholder immune to later passes."""
             key = f"\x00SL{counter[0]}\x00"
             counter[0] += 1
             placeholders[key] = value
+            if url_value is not None:
+                url_escapes[key] = url_value
             return key
 
-        # <!everyone>/<!channel>/<!here> broadcast even from bots; escape the leading `<`.
-        text = _SLACK_SPECIAL_MENTION_RE.sub(lambda m: m.group(0).replace("<", "&lt;", 1), content)
+        text = content
 
         def _protect_fence(m):
             # Slack renders the language tag literally, so drop it — only for a line-start
@@ -3182,8 +3185,27 @@ class SlackAdapter(BasePlatformAdapter):
                 block = re.sub(r"\A```[^\s`]+[ \t]*(\r?\n)", r"```\1", block)
             return _ph(block)
 
+        def _protect_entity(m):
+            prefix = m.string[:m.start()]
+            if (len(prefix) - len(prefix.rstrip("\\"))) % 2:
+                # An escaped opening bracket is literal text, never a Slack mention.
+                return m.group(0)
+            if _SLACK_SPECIAL_MENTION_RE.fullmatch(m.group(0)):
+                # Do not introduce an entity after a backslash: the ordinary
+                # escape pass would turn the resulting \&lt; into &amp;lt;.
+                value = _SLACK_HTML_ENTITY_RE.sub(lambda e: _SLACK_HTML_ENTITIES[e.group(1)], m.group(0))
+                return _ph(value.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;"))
+            return _ph(m.group(0))
+
         def _convert_markdown_link(m):
             url = m.group(2).strip()
+            # Destinations need literal punctuation, not display-only code spans.
+            for key, value in url_escapes.items():
+                url = url.replace(key, value)
+            # An angle-wrapped destination may already be a protected autolink.
+            if url in placeholders:
+                # Unlike autolinks, Markdown destinations allow punctuation escapes.
+                url = re.sub(punctuation_escape, r"\1", placeholders[url])
             if url.startswith("<") and url.endswith(">"):
                 url = url[1:-1].strip()
             return _ph(f"<{url}|{m.group(1)}>")
@@ -3205,8 +3227,15 @@ class SlackAdapter(BasePlatformAdapter):
         passes = (
             (r"(```(?:[^\n]*\n)?[\s\S]*?```)", _protect_fence, 0),
             (r"(`[^`]+`)", lambda m: _ph(m.group(0)), 0),
+            # CommonMark escapes do not apply inside autolinks/native entities.
+            (r"(<(?:[@#!]|(?:https?|mailto|tel):)[^>\n]+>)", _protect_entity, 0),
+            # Slack does not support Markdown backslash escapes. Code spans keep
+            # literal emphasis delimiters literal even in the final mrkdwn render.
+            (punctuation_escape,
+             lambda m: _ph(f"`{m.group(1)}`", url_value=m.group(1)) if m.group(1) in "*_~" else
+                       _ph(m.group(1).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")), 0),
+            (r"\\(\r?\n)", lambda m: m.group(1), 0),
             (r"(?<!!)\[([^\]]+)\]\(([^()]*(?:\([^()]*\)[^()]*)*)\)", _convert_markdown_link, 0),
-            (r"(<(?:[@#!]|(?:https?|mailto|tel):)[^>\n]+>)", lambda m: _ph(m.group(1)), 0),
             (r"^(>+\s)", lambda m: _ph(m.group(0)), re.MULTILINE),
             None,
             (r"^#{1,6}\s+(.+)$", _convert_header, re.MULTILINE),
