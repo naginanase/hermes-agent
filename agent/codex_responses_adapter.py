@@ -465,7 +465,7 @@ def _replay_message_items(
         if not (isinstance(raw_item, dict) and raw_item.get("type") == "message" and raw_item.get("role") == "assistant"):
             continue
         content = [
-            {"type": "output_text", "text": _str_or_empty(part.get("text", ""))}
+            _raw_responses_text_part(part)
             for part in _as_list(raw_item.get("content"))
             if isinstance(part, dict) and str(part.get("type") or "").strip() in _OUTPUT_TEXT_TYPES
         ]
@@ -837,7 +837,13 @@ def _preflight_message(item: Dict[str, Any], idx: int, ctx: _PreflightCtx) -> Di
             raise ValueError(
                 f"Codex Responses input[{idx}] message content[{part_idx}] has unsupported type {part_type!r}."
             )
-        normalized_content.append({"type": "output_text", "text": ctx.sanitize_text(_str_or_empty(part.get("text", "")))})
+        normalized_part = _raw_responses_text_part(part)
+        sanitized_text = ctx.sanitize_text(normalized_part["text"])
+        if sanitized_text != normalized_part["text"]:
+            # Original offsets cannot safely attribute rewritten replay text.
+            normalized_part.pop("annotations", None)
+        normalized_part["text"] = sanitized_text
+        normalized_content.append(normalized_part)
     if not normalized_content:
         raise ValueError(f"Codex Responses input[{idx}] message item must contain at least one text part.")
     return _assistant_message_item(item, normalized_content, is_github_responses=ctx.is_github_responses)
@@ -1025,6 +1031,76 @@ def _text_chunks(parts: Any, types: Optional[set] = None) -> List[str]:
     return [text for text in (getattr(part, "text", None) for part in selected) if _nonempty_str(text)]
 
 
+def _citation_annotations(part: Any) -> List[Dict[str, Any]]:
+    """JSON-safe annotation sidecar, accepting both SDK objects and raw dictionaries."""
+    annotations = []
+    for annotation in _as_list(_field(part, "annotations")):
+        if isinstance(annotation, dict):
+            annotations.append(dict(annotation))
+        elif hasattr(annotation, "model_dump"):
+            annotations.append(annotation.model_dump(mode="json"))
+        elif isinstance(annotation, SimpleNamespace):
+            annotations.append(vars(annotation).copy())
+    return annotations
+
+
+def _raw_responses_text_part(part: Any) -> Dict[str, Any]:
+    """Keep source metadata paired with its original text for persistence and replay."""
+    text = _field(part, "refusal") if _field(part, "type") == "refusal" else _field(part, "text", "")
+    raw: Dict[str, Any] = {"type": "output_text", "text": _str_or_empty(text)}
+    annotations = _citation_annotations(part)
+    if annotations:
+        raw["annotations"] = annotations
+    return raw
+
+
+_NATIVE_CITATION_RE = re.compile(r"\ue200cite\ue202([^\ue200\ue201]+)\ue201")
+
+
+def _render_responses_citations(text: str, annotations: List[Dict[str, Any]]) -> str:
+    """Replace native citation spans using their actual URL annotations, never opaque ref IDs."""
+    spans: Dict[tuple[int, int], List[str]] = {}
+    unlocated: List[str] = []
+    for annotation in annotations:
+        if annotation.get("type") != "url_citation":
+            continue
+        start, end = annotation.get("start_index"), annotation.get("end_index")
+        url = annotation.get("url")
+        if not isinstance(url, str) or not re.fullmatch(r"https?://[^\s]+", url):
+            continue
+        title = annotation.get("title") or url
+        title = re.sub(r"([\\\[\]])", r"\\\1", str(title).replace("\n", " "))
+        # Delimiters can terminate a Markdown destination; backslashes can escape its closing parenthesis.
+        destination = url.translate(str.maketrans({"(": "%28", ")": "%29", "<": "%3C", ">": "%3E", "\\": "%5C"}))
+        link = f"[{title}]({destination})"
+        if type(start) is not int or type(end) is not int or not 0 <= start <= end <= len(text):
+            if link not in unlocated:
+                unlocated.append(link)
+            continue
+        partial_marker = any(marker.start() < start < marker.end() or marker.start() < end < marker.end()
+                             for marker in _NATIVE_CITATION_RE.finditer(text))
+        if partial_marker:
+            if link not in unlocated:
+                unlocated.append(link)
+            continue
+        # Source ranges over prose become insertions at their original end offset.
+        # Only a whole native marker is replaced; this also makes overlapping
+        # prose ranges safe because earlier offsets never see already-inserted links.
+        key = (start, end) if _NATIVE_CITATION_RE.fullmatch(text[start:end]) else (end, end)
+        links = spans.setdefault(key, [])
+        if link not in links:
+            links.append(link)
+    for (start, end), links in sorted(spans.items(), reverse=True):
+        prefix = " " if start == end else ""
+        text = text[:start] + prefix + " ".join(links) + text[end:]
+    text = _NATIVE_CITATION_RE.sub(
+        lambda match: "[unresolved citation: " + ", ".join(match.group(1).split("\ue202")) + "]", text,
+    )
+    if unlocated:
+        text += "\n\nSources (citation location unavailable): " + " ".join(unlocated)
+    return text
+
+
 def _extract_responses_message_text(item: Any) -> str:
     """Assistant text from a Responses message output item. A ``refusal`` part carries the
     model's explanation in ``refusal`` instead of ``text``; it is message text too, otherwise a
@@ -1034,7 +1110,7 @@ def _extract_responses_message_text(item: Any) -> str:
         ptype = _field(part, "type")
         text = _field(part, "refusal") if ptype == "refusal" else (_field(part, "text") if ptype in _OUTPUT_TEXT_TYPES else None)
         if _nonempty_str(text):
-            chunks.append(text)
+            chunks.append(_render_responses_citations(text, _citation_annotations(part)))
     return "".join(chunks).strip()
 
 
@@ -1151,8 +1227,15 @@ class _OutputScan:
         # to the reasoning channel; the exact item is still preserved for replay/cache.
         (self.reasoning_parts if is_commentary_phase else self.content_parts).append(message_text)
         item_id = getattr(item, "id", None)
+        # Keep native part boundaries, text and annotations together: offsets are part-local.
+        raw_content = []
+        for part in _as_list(_field(item, "content")):
+            ptype = _field(part, "type")
+            text = _field(part, "refusal") if ptype == "refusal" else _field(part, "text")
+            if (ptype in _OUTPUT_TEXT_TYPES or ptype == "refusal") and isinstance(text, str):
+                raw_content.append(_raw_responses_text_part(part))
         self.message_items_raw.append(_message_item(
-            [{"type": "output_text", "text": message_text}], status=_normalize_responses_message_status(item_status),
+            raw_content, status=_normalize_responses_message_status(item_status),
             item_id=item_id if isinstance(item_id, str) else None, phase=normalized_phase,
         ))
 
@@ -1193,7 +1276,7 @@ def _normalize_codex_response(
     final_text = "\n".join(scan.content_parts).strip()
     if not final_text and (scan.saw_final_answer_phase or not scan.saw_commentary_phase):
         out_text = getattr(response, "output_text", "")
-        final_text = out_text.strip() if isinstance(out_text, str) else final_text
+        final_text = _render_responses_citations(out_text.strip(), []) if isinstance(out_text, str) else final_text
     # Tool-call leak recovery: gpt-5.x sometimes emits the intended ``function_call`` as plain Harmony text
     # (``to=functions.foo {json}``) or Codex-CLI shell JSON (``{"cmd": ...}``). Treat as incomplete so the
     # continuation re-elicits a real call; clear the garbage.

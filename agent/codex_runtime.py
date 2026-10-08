@@ -844,9 +844,10 @@ def _output_text_of(item: Any) -> str:
 class _CodexResponseAssembler:
     """Assemble a Response-shaped ``SimpleNamespace`` from raw Responses SSE events.
 
-    Only ``usage`` / ``status`` / ``id`` / ``service_tier`` are read from the terminal frame — never ``response.output``. Output
-    items come from ``output_item.done``, or are synthesized from text deltas, or settled from function calls
-    announced via ``output_item.added`` but never confirmed (some backends omit per-item done events on success)."""
+    Terminal frames provide status/usage/id/service_tier and optional citation metadata, never authoritative
+    output text/items. Output items come from ``output_item.done``, or are synthesized from text deltas, or settled
+    from function calls announced via ``output_item.added`` but never confirmed (some backends omit per-item done
+    events on success)."""
 
     has_tool_calls = first_delta_fired = saw_terminal = False
     next_output_sequence = 0
@@ -867,6 +868,8 @@ class _CodexResponseAssembler:
         # back in stream order.
         self.output_indexes, self.output_sequences = [], []
         self.text_deltas, self.commentary_text_deltas = [], []
+        # Native citations arrive separately from text; keep part-local offsets intact.
+        self.text_parts: Dict[tuple, Dict[str, Any]] = {}
         # pending_function_calls: announced-but-unconfirmed function calls keyed by item id. announced_output_order:
         # first-observed (sequence, output_index) per announced item id so a later .done keeps its announced position.
         self.pending_function_calls: Dict[str, Dict[str, Any]] = {}
@@ -896,6 +899,17 @@ class _CodexResponseAssembler:
                     "output_index": announced_index, "sequence": announced_sequence,
                 }
 
+    def _text_part(self, event: Any) -> Dict[str, Any]:
+        key = (_event_field(event, "item_id"), _event_field(event, "output_index"),
+               _event_field(event, "content_index", 0))
+        return self.text_parts.setdefault(key, {"text": "", "annotations": {}})
+
+    def _on_annotation_added(self, event: Any, event_type: str) -> None:
+        annotation = _event_field(event, "annotation")
+        if annotation is not None:
+            part = self._text_part(event)
+            part["annotations"][_event_field(event, "annotation_index", len(part["annotations"]))] = annotation
+
     def _on_text_delta(self, event: Any, event_type: str) -> None:
         delta_text = _event_field(event, "delta", "")
         if not delta_text:
@@ -911,6 +925,7 @@ class _CodexResponseAssembler:
             self._safe(self.on_reasoning_delta, "on_reasoning_delta", delta_text)
         else:
             self.text_deltas.append(delta_text)
+            self._text_part(event)["text"] += delta_text
             if self.has_tool_calls:
                 return
             if not self.first_delta_fired:
@@ -926,6 +941,7 @@ class _CodexResponseAssembler:
         refusal_text = _event_field(event, "delta", "")
         if isinstance(refusal_text, str) and refusal_text:
             self.text_deltas.append(refusal_text)
+            self._text_part(event)["text"] += refusal_text
 
     def _on_function_call(self, event: Any, event_type: str) -> None:
         self.has_tool_calls = True
@@ -978,6 +994,24 @@ class _CodexResponseAssembler:
         if resp_obj is not None:
             self.terminal_usage, self.terminal_response_id = _event_field(resp_obj, "usage"), _event_field(resp_obj, "id")
             self.terminal_service_tier = _event_field(resp_obj, "service_tier")
+            # Some relays retain citations only in the terminal envelope. Salvage
+            # metadata, never terminal output text/items (which may be malformed).
+            from agent.codex_responses_adapter import _citation_annotations
+            terminal_output = _event_field(resp_obj, "output")
+            for output_index, item in enumerate(terminal_output if isinstance(terminal_output, list) else []):
+                content = _event_field(item, "content")
+                for content_index, part in enumerate(content if isinstance(content, list) else []):
+                    annotations = _citation_annotations(part)
+                    if not annotations:
+                        continue
+                    key = (_event_field(item, "id"), output_index, content_index)
+                    source = self.text_parts.setdefault(key, {"text": "", "annotations": {}})
+                    text = _event_field(part, "text", "")
+                    if source["text"] and source["text"] != text:
+                        continue  # stale offsets cannot be attached to different text
+                    source["annotation_text"] = text
+                    for annotation in annotations:
+                        source["annotations"].setdefault(len(source["annotations"]), annotation)
             rstatus = _event_field(resp_obj, "status")
             if isinstance(rstatus, str):
                 self.terminal_status = rstatus
@@ -996,6 +1030,7 @@ class _CodexResponseAssembler:
         "response.output_item.added": _on_item_added, "response.output_item.done": _on_item_done,
         "response.completed": _on_terminal, "response.incomplete": _on_terminal, "response.failed": _on_terminal,
         "response.refusal.delta": _on_refusal_delta,
+        "response.output_text.annotation.added": _on_annotation_added,
     }
     _FUZZY_HANDLERS = (
         (lambda t: "output_text.delta" in t, _on_text_delta), (lambda t: "function_call" in t, _on_function_call),
@@ -1029,12 +1064,63 @@ class _CodexResponseAssembler:
             indexed.sort(key=lambda entry: entry[1])
         return [entry[2] for entry in indexed]
 
+    def _attach_text_annotations(self, output: List[Any]) -> List[Any]:
+        """Supplement done parts from SSE annotations without flattening their offsets."""
+        from agent.codex_responses_adapter import _citation_annotations
+
+        done_indexes = {id(item): index for item, index in zip(self.output_items, self.output_indexes)}
+        merged = []
+        for item in output:
+            item_id = _event_field(item, "id")
+            output_index = _event_field(item, "_output_index", done_indexes.get(id(item)))
+            content = _event_field(item, "content")
+            if _event_field(item, "type") != "message" or not isinstance(content, list):
+                merged.append(item)
+                continue
+            parts = []
+            for content_index, part in enumerate(content):
+                annotations = _citation_annotations(part)
+                for (source_id, source_output_index, source_index), streamed in self.text_parts.items():
+                    same_item = (source_id == item_id if source_id is not None and item_id is not None else
+                                 source_output_index is not None and source_output_index == output_index)
+                    if same_item and source_index == content_index:
+                        source_text = streamed.get("annotation_text") or streamed["text"]
+                        if source_text and source_text != _event_field(part, "text", ""):
+                            continue
+                        for annotation in streamed["annotations"].values():
+                            for raw in _citation_annotations({"annotations": [annotation]}):
+                                if raw not in annotations:
+                                    annotations.append(raw)
+                if annotations:
+                    data = dict(part) if isinstance(part, dict) else vars(part).copy()
+                    data["annotations"] = annotations
+                    part = SimpleNamespace(**data)
+                parts.append(part)
+            data = dict(item) if isinstance(item, dict) else vars(item).copy()
+            data["content"] = parts
+            merged.append(SimpleNamespace(**data))
+        return merged
+
     def result(self) -> SimpleNamespace:
         # With only plain text deltas (no tool calls), synthesize one message item.
         output: List[Any] = list(self.output_items)
         if not output and self.text_deltas and not self.has_tool_calls:
-            content = [SimpleNamespace(type="output_text", text="".join(self.text_deltas))]
-            output = [SimpleNamespace(type="message", role="assistant", status="completed", content=content)]
+            if any(part["annotations"] for part in self.text_parts.values()):
+                messages: Dict[Any, Any] = {}
+                for (item_id, output_index, content_index), part in self.text_parts.items():
+                    if not part["text"]:
+                        continue
+                    key = item_id if item_id is not None else output_index
+                    message = messages.setdefault(key, SimpleNamespace(
+                        type="message", id=item_id, _output_index=output_index,
+                        role="assistant", status="completed", content=[]))
+                    while len(message.content) <= content_index:
+                        message.content.append(SimpleNamespace(type="output_text", text=""))
+                    message.content[content_index] = SimpleNamespace(type="output_text", text=part["text"])
+                output = list(messages.values())
+            else:
+                content = [SimpleNamespace(type="output_text", text="".join(self.text_deltas))]
+                output = [SimpleNamespace(type="message", role="assistant", status="completed", content=content)]
         # Done items stay authoritative; settlement only fills the gap left by backends that omit
         # per-item done events on a successful completion.
         if self.pending_function_calls and self.saw_response_completed:
@@ -1042,6 +1128,7 @@ class _CodexResponseAssembler:
         # No terminal frame AND no usable content = truncated / rejected stream.
         if not self.saw_terminal and not output:
             raise RuntimeError("Codex Responses stream did not emit a terminal response")
+        output = self._attach_text_annotations(output)
         return SimpleNamespace(
             output=output, output_text="".join(self.text_deltas), usage=self.terminal_usage, status=self.terminal_status,
             id=self.terminal_response_id, model=self.model, incomplete_details=self.terminal_incomplete_details,
