@@ -54,8 +54,10 @@ from gateway.platforms.event import MessageEvent, MessageType, ProcessingOutcome
 
 try:  # sibling module; support both package and flat plugin-dir import
     from .block_kit import render_blocks, sanitize_blocks
+    from .adapter_native_stream import SlackNativeFinalizationMixin
 except ImportError:  # pragma: no cover - plugin loaded outside package context
     from block_kit import render_blocks, sanitize_blocks  # type: ignore
+    from adapter_native_stream import SlackNativeFinalizationMixin
 
 
 logger = logging.getLogger(__name__)
@@ -1003,13 +1005,16 @@ def _extra_or_env_channel_set_getter(
     return getter
 
 
-class SlackAdapter(BasePlatformAdapter):
+class SlackAdapter(SlackNativeFinalizationMixin, BasePlatformAdapter):
     """Slack bot adapter (Socket Mode).
     Needs SLACK_BOT_TOKEN (xoxb-, API calls) and SLACK_APP_TOKEN (xapp-, Socket Mode). DMs +
     mention-gated channels, threads, attachments, slash commands, status text."""
 
     MAX_MESSAGE_LENGTH = 39000  # Slack API allows 40,000 chars; leave margin
     supports_code_blocks = True  # Slack mrkdwn renders fenced code blocks
+    # Native drafts persist as the answer: keep frames prefix-stable and one stream
+    # across tool boundaries; only the turn final seals it (unlike ephemeral drafts).
+    draft_stream_is_message = True
     # Typing indicator is a text status line (assistant.threads.setStatus): fed live phrases.
     supports_status_text = True
     splits_long_messages = True  # send() chunks via truncate_message(MAX_MESSAGE_LENGTH)
@@ -2228,13 +2233,16 @@ class SlackAdapter(BasePlatformAdapter):
         chat_id = await self._dm_target(chat_id, metadata)
         thread_ts = None
         try:
+            from agent.slack_citation_delivery import prepare_slack_citation_delivery
+            original_content = content
+            content = prepare_slack_citation_delivery(content).text
             team_id = self._metadata_team_id(metadata)
             slash_ctx = self._pop_slash_context(chat_id, team_id)
             if slash_ctx:
                 return await self._send_slash_reply(chat_id, slash_ctx, content, metadata)
             # An active native stream that this content finalizes IS the final
             # message: seal it instead of posting a duplicate.
-            stream_result = await self._try_finalize_stream(chat_id, content, metadata)
+            stream_result = await self._try_finalize_stream(chat_id, original_content, metadata)
             if stream_result is not None:
                 return stream_result
             formatted = self.format_message(content)
@@ -2639,80 +2647,6 @@ class SlackAdapter(BasePlatformAdapter):
                 "[Slack] chat.stopStream failed for %s/%s: %s", chat_id, stream.get("ts"), e)
             return False
 
-    async def _try_finalize_stream(
-        self, chat_id: str, content: str, metadata: Optional[Dict[str, Any]] = None
-    ) -> Optional[SendResult]:
-        """Seal the active native stream if ``content`` is its final text: SendResult when the
-        stream IS the final message; None when unrelated (interim commentary), leaving it open.
-
-        Invariant (duplicate-final class): a successfully streamed answer is NEVER posted a
-        second time. A fresh post happens only when the streamed message is demonstrably
-        uncommittable — the seal failed AND an in-place ``chat.update`` of it failed — or when
-        the content is unrelated to the stream."""
-        md = metadata or {}
-        # Streaming contract: interim sends (commentary, segment-tail flushes) and editable
-        # previews are never the turn final, whatever their text looks like.
-        if md.get("_interim_send") or md.get("expect_edits"):
-            return None
-        key = self._stream_key(chat_id, md)
-        stream = self._active_streams.get(key) if key else None
-        if stream is None:
-            return None
-        text = self._strip_stream_cursor(content)
-        sent = stream.get("sent", "")
-        kind, delta = self._stream_relation(sent, text)
-        if kind == "unrelated":
-            # A turn-final that only restyled the streamed answer (mrkdwn conversion turned
-            # ``*Done:*`` into ``_Done:_``) replaces it in place so the thread holds ONE answer.
-            # Anything else — including mid-turn notify replies (/status, /approve, clarify
-            # answers) that share the thread key — is not this stream's final: leave the stream
-            # open and let send() post it fresh.
-            if not (md.get("notify") and text.strip() and sent.strip()
-                    and self._mrkdwn_insensitive(text) == self._mrkdwn_insensitive(sent)):
-                return None
-            return await self._commit_stream(key, stream, text, metadata, replace=True)
-        if kind == "extends" and len(delta) > self.MAX_MESSAGE_LENGTH:
-            # Tail too large for one append: close the stream on what is visible and let the
-            # normal split path deliver the full final.
-            self._active_streams.pop(key, None)
-            await self._seal_stream(key, stream)
-            return None
-        return await self._commit_stream(key, stream, text, metadata, delta=delta)
-
-    async def _commit_stream(
-        self, key: Tuple[str, str, str], stream: Dict[str, Any], text: str,
-        metadata: Optional[Dict[str, Any]], delta: str = "", replace: bool = False,
-    ) -> Optional[SendResult]:
-        """Close ``stream`` as the turn's final message holding ``text``: SendResult on success,
-        None when send() must post the final fresh (a duplicate beats a lost answer).
-
-        Bounded: stopStream (appending ``delta``), one retry ONLY when nothing is appended
-        (``markdown_text`` APPENDS: a first attempt that landed server-side but raised here would
-        repeat the tail), then one idempotent in-place ``chat.update`` carrying the full text —
-        always when ``replace`` (the content changed) or the seal failed, otherwise only to apply
-        a rich Block Kit layout (non-fatal: the streamed markdown stands)."""
-        chat_id, ts = key[1], stream["ts"]
-        self._active_streams.pop(key, None)
-        sealed = await self._seal_stream(key, stream, delta=delta)
-        if not sealed and not (delta and delta.strip()):
-            sealed = await self._seal_stream(key, stream)
-        if sealed and not replace and not self._maybe_blocks(text):
-            committed = True
-        else:
-            # A reopened stream's message starts at ``base``; the sealed one before it already
-            # shows the prefix. (A ``replace`` rewrite is not prefix-aligned, so use it whole.)
-            shown = text if replace else text[stream.get("base", 0):]
-            edited = await self.edit_message(chat_id, ts, shown, finalize=True, metadata=metadata)
-            committed = edited.success or (sealed and not replace)
-            if not sealed:
-                logger.warning(
-                    "[Slack] chat.stopStream failed for %s/%s; %s", chat_id, ts,
-                    "final committed via chat.update instead (no duplicate post)" if committed
-                    else "in-place update failed too, delivering the final as a fresh post")
-        if not committed:
-            return None
-        await self.stop_typing(chat_id, metadata)
-        return SendResult(success=True, message_id=ts)
 
     async def send_typing(self, chat_id: str, metadata=None) -> None:
         """Show a thread status via assistant.threads.setStatus.
@@ -3136,6 +3070,8 @@ class SlackAdapter(BasePlatformAdapter):
         1. ``markdown_blocks`` — Slack's native ``markdown`` block renders the *raw* standard markdown
         (tables, headers, code fences with syntax highlighting) with Slack doing the translation (#8552). 2.
         """
+        from agent.slack_citation_delivery import prepare_slack_citation_delivery
+        content = prepare_slack_citation_delivery(content).text
         if self._extra_flag("markdown_blocks"):
             md_blocks = self._markdown_block_payload(content)
             if md_blocks:
@@ -3160,9 +3096,14 @@ class SlackAdapter(BasePlatformAdapter):
         mentions are escaped during entity protection so output can't ping @channel."""
         if not content:
             return content
+        # Provider-native citation IDs are diagnostics, not usable Slack links.
+        # The gateway attaches retained sources; direct sends still need an honest fallback.
+        from agent.slack_citation_delivery import prepare_slack_citation_delivery
+        content = prepare_slack_citation_delivery(content).text
         content = _wrap_markdown_tables(content)
         placeholders: dict = {}
         url_escapes: dict = {}
+        code_spans: set = set()
         counter = [0]
         punctuation_escape = r"\\([!\"#$%&'()*+,\-./:;<=>?@\[\]\\^_`{|}~])"
 
@@ -3214,38 +3155,61 @@ class SlackAdapter(BasePlatformAdapter):
             inner = re.sub(r"\*\*(.+?)\*\*", r"\1", m.group(1).strip())
             return _ph(f"*{inner}*")
 
+        def _inline_span(m, value: str) -> str:
+            # Slack needs an ASCII boundary next to CJK/fullwidth prose. Keep
+            # padding outside the delimiters and inside the protected value.
+            before = m.string[max(0, m.start() - 1):m.start()]
+            after = m.string[m.end():m.end() + 1]
+            left, right = (
+                " " if char and not char.isspace() and unicodedata.east_asian_width(char) in "WF" else ""
+                for char in (before, after)
+            )
+            return _ph(f"{left}{value}{right}")
+
+        def _protect_inline_code(m, value: Optional[str] = None, *, url_value: Optional[str] = None) -> str:
+            # Defer padding until links/entities are protected: their code-looking
+            # data must remain literal, including Markdown destination escapes.
+            key = _ph(m.group(0) if value is None else value, url_value=url_value)
+            code_spans.add(key)
+            return key
+
         def _convert_bold(m):
             # Slack misses a closing * after a non-word char and silently truncates the
             # message; insert U+200B before it.
             inner = m.group(1)
             zw = "\u200b" if inner and not (inner[-1].isalnum() or inner[-1] == "_") else ""
-            return _ph(f"*{inner}{zw}*")
+            return _inline_span(m, f"*{inner}{zw}*")
 
         # Ordered passes: protect code/links/entities/quotes, escape, then convert emphasis.
         # Escaping unescapes first in ONE regex pass (sequential replaces would decode
         # "&amp;lt;" twice). ``None`` marks the escape step.
         passes = (
             (r"(```(?:[^\n]*\n)?[\s\S]*?```)", _protect_fence, 0),
-            (r"(`[^`]+`)", lambda m: _ph(m.group(0)), 0),
+            (r"(`[^`]+`)", _protect_inline_code, 0),
             # CommonMark escapes do not apply inside autolinks/native entities.
             (r"(<(?:[@#!]|(?:https?|mailto|tel):)[^>\n]+>)", _protect_entity, 0),
             # Slack does not support Markdown backslash escapes. Code spans keep
             # literal emphasis delimiters literal even in the final mrkdwn render.
             (punctuation_escape,
-             lambda m: _ph(f"`{m.group(1)}`", url_value=m.group(1)) if m.group(1) in "*_~" else
+             lambda m: _protect_inline_code(m, f"`{m.group(1)}`", url_value=m.group(1)) if m.group(1) in "*_~" else
                        _ph(m.group(1).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")), 0),
             (r"\\(\r?\n)", lambda m: m.group(1), 0),
             (r"(?<!!)\[([^\]]+)\]\(([^()]*(?:\([^()]*\)[^()]*)*)\)", _convert_markdown_link, 0),
             (r"^(>+\s)", lambda m: _ph(m.group(0)), re.MULTILINE),
             None,
             (r"^#{1,6}\s+(.+)$", _convert_header, re.MULTILINE),
-            (r"\*\*\*(.+?)\*\*\*", lambda m: _ph(f"*_{m.group(1)}_*"), 0),
+            (r"\*\*\*(.+?)\*\*\*", lambda m: _inline_span(m, f"*_{m.group(1)}_*"), 0),
             (r"\*\*(.+?)\*\*", _convert_bold, 0),
             # *text* → _text_ only when non-whitespace touches both delimiters ("a * b * c" stays).
-            (r"(?<!\*)\*(\S(?:[^*\n]*?\S)?)\*(?!\*)", lambda m: _ph(f"_{m.group(1)}_"), 0),
-            (r"~~(.+?)~~", lambda m: _ph(f"~{m.group(1)}~"), 0))
+            (r"(?<!\*)\*(\S(?:[^*\n]*?\S)?)\*(?!\*)", lambda m: _inline_span(m, f"_{m.group(1)}_"), 0),
+            (r"~~(.+?)~~", lambda m: _inline_span(m, f"~{m.group(1)}~"), 0))
         for step in passes:
             if step is None:
+                text = re.sub(
+                    r"\x00SL\d+\x00",
+                    lambda m: _inline_span(m, placeholders[m.group(0)]) if m.group(0) in code_spans else m.group(0),
+                    text,
+                )
                 text = _SLACK_HTML_ENTITY_RE.sub(lambda m: _SLACK_HTML_ENTITIES[m.group(1)], text)
                 text = text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
             else:

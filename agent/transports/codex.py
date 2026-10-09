@@ -872,7 +872,7 @@ class ResponsesApiTransport(ProviderTransport):
         )
 
     def validate_response(self, response: Any) -> bool:
-        """True if response.output is a non-empty list, or a terminal content_filter refusal.
+        """True for output, retained native metadata, or a terminal content_filter refusal.
 
         An incomplete/content_filter response with no output must reach normalization,
         not a retry. Does NOT check output_text fallback — the caller handles that.
@@ -882,6 +882,9 @@ class ResponsesApiTransport(ProviderTransport):
         output = getattr(response, "output", None)
         if isinstance(output, list) and output:
             return True
+        from agent.retrieval_sources import extract_retrieval_sources
+        if extract_retrieval_sources(response):
+            return True  # metadata-only turns normalize as incomplete, never a fabricated answer
         status = str(getattr(response, "status", "") or "").strip().lower()
         details = getattr(response, "incomplete_details", None)
         raw_reason = details.get("reason") if isinstance(details, dict) else getattr(details, "reason", "")

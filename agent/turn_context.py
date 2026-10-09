@@ -1123,6 +1123,10 @@ def build_turn_context(
     if agent._cached_system_prompt is None:
         restore_or_build_system_prompt(agent, system_message, conversation_history)
     active_system_prompt = agent._cached_system_prompt
+    # Same-surface Slack guidance can change between releases too. Deliver its
+    # compatibility correction after the cached prefix, including on cached agents.
+    from agent.surface_switch import stage_slack_hint_upgrade
+    stage_slack_hint_upgrade(agent, active_system_prompt or "", conversation_history)
 
     # Bot Mode DM tool — injected ONLY into a bot's canonical "Bot Chat" session (same
     # gate as the protocol section); gate is session-stable, so cache-safe.

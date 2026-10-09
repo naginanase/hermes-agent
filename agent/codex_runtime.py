@@ -11,6 +11,7 @@ import logging
 import os
 import threading
 import time
+import uuid
 from contextlib import suppress
 from types import SimpleNamespace
 from typing import Any, Callable, Dict, List
@@ -860,7 +861,7 @@ class _CodexResponseAssembler:
     # terminal_status defaults to "completed", so settlement needs an explicitly observed response.completed frame.
     saw_response_completed = False
 
-    def __init__(self, *, model, on_text_delta, on_reasoning_delta, on_commentary_message, on_first_delta):
+    def __init__(self, *, model, on_text_delta, on_reasoning_delta, on_commentary_message, on_first_delta, request_id=None):
         self.model, self.on_text_delta, self.on_reasoning_delta = model, on_text_delta, on_reasoning_delta
         self.on_commentary_message, self.on_first_delta = on_commentary_message, on_first_delta
         self.output_items: List[Any] = []
@@ -874,6 +875,8 @@ class _CodexResponseAssembler:
         # first-observed (sequence, output_index) per announced item id so a later .done keeps its announced position.
         self.pending_function_calls: Dict[str, Dict[str, Any]] = {}
         self.announced_output_order: Dict[str, tuple] = {}
+        self.retrieval_request_id = request_id if isinstance(request_id, str) and request_id else uuid.uuid4().hex
+        self.received_sources: List[dict] = []
 
     def _safe(self, cb: Callable | None, label: str, *args: Any) -> None:
         _call_guarded(cb, f"Codex stream {label} raised", args=args)
@@ -909,6 +912,13 @@ class _CodexResponseAssembler:
         if annotation is not None:
             part = self._text_part(event)
             part["annotations"][_event_field(event, "annotation_index", len(part["annotations"]))] = annotation
+            from agent.retrieval_sources import source_from_annotation
+            source = source_from_annotation(
+                annotation, request_id=self.retrieval_request_id, item_id=_event_field(event, "item_id"),
+                output_index=_event_field(event, "output_index"), content_index=_event_field(event, "content_index", 0),
+                annotation_index=_event_field(event, "annotation_index", len(part["annotations"]) - 1))
+            if source is not None:
+                self.received_sources.append(source)
 
     def _on_text_delta(self, event: Any, event_type: str) -> None:
         delta_text = _event_field(event, "delta", "")
@@ -971,6 +981,11 @@ class _CodexResponseAssembler:
         done_item = _event_field(event, "item")
         if done_item is None:
             return
+        from agent.retrieval_sources import log_retrieval_source_counts, sources_from_items
+        log_retrieval_source_counts("receive.item", {"output": [done_item]})
+        self.received_sources.extend(sources_from_items(
+            [done_item], request_id=self.retrieval_request_id,
+            output_indexes=[_event_field(event, "output_index")]))
         self.output_items.append(done_item)
         # Reuse the announced position when known (fresh tail sequence for unannounced items); the .done
         # event's own output_index wins over the announced one.
@@ -992,12 +1007,18 @@ class _CodexResponseAssembler:
         self.saw_terminal = True
         resp_obj = _event_field(event, "response")
         if resp_obj is not None:
-            self.terminal_usage, self.terminal_response_id = _event_field(resp_obj, "usage"), _event_field(resp_obj, "id")
+            self.terminal_usage = _event_field(resp_obj, "usage")
+            self.terminal_response_id = _event_field(resp_obj, "id") or self.terminal_response_id
             self.terminal_service_tier = _event_field(resp_obj, "service_tier")
             # Some relays retain citations only in the terminal envelope. Salvage
             # metadata, never terminal output text/items (which may be malformed).
             from agent.codex_responses_adapter import _citation_annotations
             terminal_output = _event_field(resp_obj, "output")
+            from agent.retrieval_sources import log_retrieval_source_counts, sources_from_items
+            log_retrieval_source_counts("receive.terminal", resp_obj)
+            self.received_sources.extend(sources_from_items(
+                terminal_output, request_id=self.retrieval_request_id, response_id=self.terminal_response_id,
+                location_verified=False))
             for output_index, item in enumerate(terminal_output if isinstance(terminal_output, list) else []):
                 content = _event_field(item, "content")
                 for content_index, part in enumerate(content if isinstance(content, list) else []):
@@ -1039,6 +1060,11 @@ class _CodexResponseAssembler:
 
     def feed(self, event: Any) -> bool:
         """Process one event; True when the stream hit a terminal frame."""
+        response_id = _event_field(event, "response_id") or _event_field(_event_field(event, "response"), "id")
+        if isinstance(response_id, str) and response_id:
+            if self.terminal_response_id and self.terminal_response_id != response_id:
+                return False  # foreign envelope/item metadata cannot enter this request's registry
+            self.terminal_response_id = response_id
         event_type = _event_field(event, "type", "")
         event_type = event_type if isinstance(event_type, str) else ""
         handler = self._EXACT_HANDLERS.get(event_type) or next((h for m, h in self._FUZZY_HANDLERS if m(event_type)), None)
@@ -1083,14 +1109,15 @@ class _CodexResponseAssembler:
                 for (source_id, source_output_index, source_index), streamed in self.text_parts.items():
                     same_item = (source_id == item_id if source_id is not None and item_id is not None else
                                  source_output_index is not None and source_output_index == output_index)
-                    if same_item and source_index == content_index:
-                        source_text = streamed.get("annotation_text") or streamed["text"]
-                        if source_text and source_text != _event_field(part, "text", ""):
-                            continue
-                        for annotation in streamed["annotations"].values():
-                            for raw in _citation_annotations({"annotations": [annotation]}):
-                                if raw not in annotations:
-                                    annotations.append(raw)
+                    if not (same_item and source_index == content_index):
+                        continue
+                    source_text = streamed.get("annotation_text") or streamed["text"]
+                    if source_text and source_text != _event_field(part, "text", ""):
+                        continue
+                    for annotation in streamed["annotations"].values():
+                        for raw in _citation_annotations({"annotations": [annotation]}):
+                            if raw not in annotations:
+                                annotations.append(raw)
                 if annotations:
                     data = dict(part) if isinstance(part, dict) else vars(part).copy()
                     data["annotations"] = annotations
@@ -1128,16 +1155,27 @@ class _CodexResponseAssembler:
         # No terminal frame AND no usable content = truncated / rejected stream.
         if not self.saw_terminal and not output:
             raise RuntimeError("Codex Responses stream did not emit a terminal response")
+        done_indexes = {id(item): index for item, index in zip(self.output_items, self.output_indexes)}
+        source_indexes = [_event_field(item, "_output_index", done_indexes.get(id(item))) for item in output]
         output = self._attach_text_annotations(output)
-        return SimpleNamespace(
+        from agent.retrieval_sources import source_registry, sources_from_items
+        assembled_sources = sources_from_items(output, request_id=self.retrieval_request_id,
+                                              output_indexes=source_indexes)
+        registry = source_registry(self.received_sources + assembled_sources, request_id=self.retrieval_request_id,
+                                   response_id=self.terminal_response_id)
+        result = SimpleNamespace(
             output=output, output_text="".join(self.text_deltas), usage=self.terminal_usage, status=self.terminal_status,
             id=self.terminal_response_id, model=self.model, incomplete_details=self.terminal_incomplete_details,
-            error=self.terminal_error, service_tier=self.terminal_service_tier)
+            error=self.terminal_error, service_tier=self.terminal_service_tier,
+            retrieval_source_registry=registry)
+        from agent.retrieval_sources import log_retrieval_source_counts
+        log_retrieval_source_counts("assembly", result)
+        return result
 
 
 def _consume_codex_event_stream(
     event_iter: Any, *, model: str, on_text_delta=None, on_reasoning_delta=None, on_commentary_message=None,
-    on_first_delta=None, on_event=None, interrupt_check=None,
+    on_first_delta=None, on_event=None, interrupt_check=None, request_id=None,
 ) -> SimpleNamespace:
     """Consume a Codex Responses SSE stream into a Response-shaped ``SimpleNamespace`` (see
     :class:`_CodexResponseAssembler`; ``status`` is ``completed`` when the stream ended with content but no
@@ -1150,7 +1188,8 @@ def _consume_codex_event_stream(
     True breaks the loop and may raise ``TimeoutError`` / ``InterruptedError`` for request retirement that
     must not become a partial final response."""
     assembler = _CodexResponseAssembler(model=model, on_text_delta=on_text_delta, on_reasoning_delta=on_reasoning_delta,
-                                        on_commentary_message=on_commentary_message, on_first_delta=on_first_delta)
+                                        on_commentary_message=on_commentary_message, on_first_delta=on_first_delta,
+                                        request_id=request_id)
     for event in event_iter:
         if on_event is not None:
             try:
@@ -1191,10 +1230,12 @@ def _sanitize_consumer_codex_request(agent: Any, request: dict[str, Any]) -> dic
 def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta=None):
     """One streaming Responses API request over raw ``responses.create(stream=True)`` events."""
     import httpx as _httpx
-    from openai import APIConnectionError as _APIConnectionError
+    from openai import APIConnectionError as _APIConnectionError, BadRequestError as _BadRequestError
     from agent import relay_llm
     transport_errors = (_httpx.RemoteProtocolError, _httpx.ReadTimeout, _httpx.ReadError, _httpx.ConnectError, ConnectionError)
     active_client = client or agent._ensure_primary_openai_client(reason="codex_stream_direct")
+    # Snapshot before asynchronous finalizers or a newer logical request mutate the agent.
+    retrieval_request_id = getattr(agent, "_current_api_request_id", None) or uuid.uuid4().hex
     max_stream_retries, model = 1, api_kwargs.get("model")
     # Accumulate streamed text so callers / compat shims can read it.
     agent._codex_streamed_text_parts: list = []
@@ -1272,7 +1313,22 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
             raise TimeoutError("Codex Responses stream request retired before terminal response")
         return bool(agent._interrupt_requested)
 
+    source_probe_fallback_used = False
+    source_include = "web_search_call.action.sources"
+
+    def _omit_source_include(stream_kwargs: dict[str, Any]) -> dict[str, Any]:
+        for name in (None, "extra_body"):
+            container = stream_kwargs if name is None else stream_kwargs.get(name)
+            if isinstance(container, dict) and isinstance(container.get("include"), list):
+                container = {**container, "include": [entry for entry in container["include"] if entry != source_include]}
+                if name is None:
+                    stream_kwargs = container
+                else:
+                    stream_kwargs[name] = container
+        return stream_kwargs
+
     def _open_codex_stream(next_api_kwargs: dict[str, Any]):
+        nonlocal source_probe_fallback_used
         from hermes_cli.providers import is_actual_route
 
         if is_actual_route(
@@ -1283,8 +1339,32 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
                 "Actual requests require Chat Completions; refusing to call /responses."
             )
         stream_kwargs = _sanitize_consumer_codex_request(agent, next_api_kwargs)
+        # Physical retries rebuild kwargs; keep this request's rejected include omitted.
+        if source_probe_fallback_used:
+            stream_kwargs = _omit_source_include(stream_kwargs)
         stream_kwargs["stream"] = True
-        return active_client.responses.create(**bypass_sdk_request_transform(stream_kwargs))
+        try:
+            return active_client.responses.create(**bypass_sdk_request_transform(stream_kwargs))
+        except _BadRequestError as exc:
+            # Only an EXPLICIT request_overrides.include is a capability probe.
+            # The public Responses spec is not proof of consumer Codex support.
+            # A targeted pre-stream 400 gets one fallback; no global toggle,
+            # no retry of a billed/partially received stream, no error-body log.
+            backend = getattr(agent, "_is_codex_backend", None)
+            message = str(getattr(exc, "message", "") or "").lower()
+            param = getattr(exc, "param", None)
+            containers = [stream_kwargs, stream_kwargs.get("extra_body")]
+            requested = any(isinstance(c, dict) and isinstance(c.get("include"), list)
+                            and source_include in c["include"] for c in containers)
+            targeted = (source_include in message and "include" in message
+                        and any(word in message for word in ("unsupported", "not supported", "invalid", "unknown", "unrecognized", "not allowed"))
+                        and (param is None or str(param).startswith("include")))
+            if source_probe_fallback_used or not (requested and targeted and callable(backend) and backend()):
+                raise
+            source_probe_fallback_used = True
+            stream_kwargs = _omit_source_include(stream_kwargs)
+            logger.info("Codex native source include probe rejected before stream; retrying once without optional source include")
+            return active_client.responses.create(**bypass_sdk_request_transform(stream_kwargs))
 
     def _log_failure(exc: BaseException) -> None:
         request_body_bytes, exception_chain = _codex_request_failure_details(exc)
@@ -1410,7 +1490,8 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
                     dict(api_kwargs), _open_codex_stream,
                     session_id=str(getattr(agent, "session_id", "") or ""),
                     name=str(getattr(agent, "provider", "") or "codex"), model_name=str(model or ""),
-                    finalizer=lambda: _consume_codex_event_stream(list(intercepted_events), model=model),
+                    finalizer=lambda: _consume_codex_event_stream(list(intercepted_events), model=model,
+                                                                 request_id=retrieval_request_id),
                     on_stream_created=_codex_stream_created, on_chunk=intercepted_events.append,
                     chunk_adapter=lambda chunk: chunk,
                     completed_response_predicate=lambda r: bool(hasattr(r, "output") and not hasattr(r, "__iter__")),
@@ -1423,6 +1504,7 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
                     on_reasoning_delta=_live(agent._fire_reasoning_delta), on_commentary_message=on_commentary_message,
                     on_first_delta=_live(on_first_delta) if on_first_delta is not None else None,
                     on_event=_fenced(_on_event), interrupt_check=_interrupt_or_superseded,
+                    request_id=retrieval_request_id,
                 )
             except transport_errors as exc:
                 if attempt >= max_stream_retries:

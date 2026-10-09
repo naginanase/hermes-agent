@@ -27,6 +27,7 @@ from gateway.media_repair import repair_explicit_computer_use_media_paths
 from gateway.platforms.base import BasePlatformAdapter
 from gateway.platforms.base_exec_approval import ea_default_reason_text
 from gateway.turn_context import TurnContext
+from gateway.run_turn_runner_stream import TurnStreamMixin
 from hermes_cli.config import cfg_get
 from utils import is_truthy_value
 
@@ -75,7 +76,7 @@ class _ExecApprovalDeclined(RuntimeError):
     """
 
 
-class TurnRunner:
+class TurnRunner(TurnStreamMixin):
     """Per-turn collaborator carrying ``GatewayRunner._run_agent_inner``'s tool-progress callbacks."""
 
     def __init__(self, runner: "GatewayRunner", ctx: TurnContext) -> None:
@@ -963,35 +964,7 @@ class TurnRunner:
                     stream_consumer.stream_deltas_enabled = consumer_stream_deltas
             except Exception as err:
                 logger.debug("Could not set up stream consumer: %s", err)
-        # Deltas tee to the stream consumer (when text streaming is on) and to streaming TTS.
-        delta_sinks = [
-            sc for sc in (
-                stream_consumer if stream_consumer and stream_consumer.stream_deltas_enabled else None,
-                stts,
-            ) if sc is not None
-        ]
-        stream_delta_cb = None
-        if delta_sinks:
-            def stream_delta_cb(text: Optional[str]) -> None:
-                if ctx._run_still_current():
-                    for sink in delta_sinks:
-                        sink.on_delta(text)
-
-        def interim_assistant_cb(text: str, *, already_streamed: bool = False) -> None:
-            if not ctx._run_still_current():
-                return
-            if stts is not None:
-                # Flush accepted deltas; completed commentary is a separate speech segment.
-                stts.on_delta(None)
-                if not already_streamed:
-                    stts.on_delta(text)
-                    stts.on_delta(None)
-            if stream_consumer is not None:
-                stream_consumer.on_segment_break() if already_streamed else stream_consumer.on_commentary(text)
-            elif not already_streamed and ctx._status_adapter and str(text or "").strip():
-                self._send_status_text(text, ctx._status_thread_metadata, "interim_assistant_callback scheduling error")
-
-        return stream_consumer, stream_delta_cb, interim_assistant_cb, want_interim_messages
+        return self._wire_stream_callbacks(stream_consumer, stts, want_interim_messages)
 
     # ── agent resolution (cache reuse vs fresh build) ───────────────────────────────────────
 
@@ -1733,6 +1706,26 @@ class TurnRunner:
 
     def _finish_stream_consumer(self, result, agent_history, stream_consumer):
         ctx = self._ctx
+        # Finalize both native streams and ordinary sends with the same citation gate.
+        # Keep original provider sidecars in result['messages'] for diagnostics/replay.
+        platform = getattr(getattr(ctx, "source", None), "platform", None)
+        if (platform in (Platform.SLACK, "slack") and isinstance(result, dict)
+                and isinstance(result.get("final_response"), str)
+                and not result.get("failed") and not result.get("interrupted")
+                and result.get("completed") is not False):
+            from agent.slack_citation_delivery import prepare_slack_citation_delivery
+            before = result["final_response"]
+            delivery = prepare_slack_citation_delivery(
+                before, messages=result.get("messages") or [], history_offset=len(agent_history),
+            )
+            if delivery.text != before:
+                result["final_response"] = delivery.text
+                result["response_transformed"] = True
+                result["citation_delivery_diagnostics"] = {
+                    "unresolved_count": delivery.unresolved_count, "source_count": delivery.source_count,
+                }
+                logger.warning("Slack citation delivery fallback: unresolved=%s retained_sources=%s",
+                               delivery.unresolved_count, delivery.source_count)
         # Canonicalize a model-emitted computer-use screenshot path at the common result boundary so
         # the streaming finalizer and the non-streaming delivery path see the same response.
         if isinstance(result, dict) and isinstance(result.get("final_response"), str):

@@ -321,8 +321,11 @@ class StreamTransportMixin:
         # connector re-appends the whole snapshot.  The final is still fence-closed.
         pre_fence_text = text
         text = ensure_closed_code_fences(text)
-        # A bare cursor renders as a stray tofu box on some clients.
-        visible_stripped = (text.replace(self.cfg.cursor, "") if self.cfg.cursor else text).strip()
+        # A bare cursor is a draft artifact, unless it is the owned final itself.
+        owned_final = (finalize and is_turn_final
+                       and self._draft_final_hook(self.metadata or {}) is not None)
+        visible_stripped = (text.replace(self.cfg.cursor, "")
+                            if self.cfg.cursor and not owned_final else text).strip()
         if not visible_stripped:
             # Native streams MUST still get a finalize frame (placeholder) to close
             # the thinking bubble, e.g. for a MEDIA-only response.
@@ -339,7 +342,8 @@ class StreamTransportMixin:
         # Tradeoff: on non-cumulative transports the held preamble is DROPPED, not
         # carried — _end_segment sees update_visible=True and resets the segment.
         preamble_finalize = finalize and not is_turn_final
-        if (self._message_id is None and len(visible_stripped) < self._MIN_NEW_MSG_CHARS
+        if (not owned_final and self._message_id is None
+                and len(visible_stripped) < self._MIN_NEW_MSG_CHARS
                 and (preamble_finalize or (self.cfg.cursor and self.cfg.cursor in text))):
             # Mid-stream: accumulate more.  Segment-break finalize: dropped (see above).
             return True
@@ -362,7 +366,7 @@ class StreamTransportMixin:
                     # A failed send disabled edits: a preview sent now could never be updated and
                     # would stay on screen truncated next to the final reply. Send only the final.
                     return False
-                return await self._first_send(text, finalize=finalize)
+                return await self._first_send(text, finalize=finalize, is_turn_final=is_turn_final)
             if not self._edit_supported:
                 return False  # edits unsupported; fallback path sends the final
             return await self._edit_existing(text, finalize=finalize, is_turn_final=is_turn_final)
@@ -446,7 +450,22 @@ class StreamTransportMixin:
         # send must still fire so the user gets a real message.
         return True if await self._send_draft_frame(frame_text) else None
 
-    async def _first_send(self, text: str, *, finalize: bool) -> bool:
+    async def _send_bounded_draft_final(self) -> bool:
+        """Hand the whole final to an opted-in draft adapter before splitting.
+
+        True means this attempt owns final delivery, not that it succeeded. A
+        failed continuation must not retry the full body beside delivered heads.
+        Other transports, partial chunks and non-authoritative exits stay legacy.
+        """
+        if (getattr(type(self.adapter), "draft_final_handles_overflow", False) is not True
+                or self._draft_final_hook(self.metadata or {}) is None):
+            return False
+        await self._notify_before_finalize()
+        if await self._send_or_edit(self._accumulated, finalize=True):
+            self._mark_final_delivered(record=self._accumulated)
+        return True
+
+    async def _first_send(self, text: str, *, finalize: bool, is_turn_final: bool = False) -> bool:
         """First send, threaded to the user's message (correct topic/thread)."""
         if getattr(self, "_egress_declined", False):
             # The connector refused this destination earlier in the run (see
@@ -459,7 +478,8 @@ class StreamTransportMixin:
             return False
         result = await self.adapter.send(
             chat_id=self.chat_id, content=text, reply_to=self._initial_reply_to_id,
-            metadata=self._metadata_for_send(final=finalize, expect_edits=not finalize))
+            metadata=self._metadata_for_send(
+                final=finalize, expect_edits=not finalize, is_turn_final=is_turn_final))
         if not result.success:
             self._edit_supported = False
             return False

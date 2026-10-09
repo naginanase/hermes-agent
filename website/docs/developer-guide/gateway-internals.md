@@ -13,6 +13,8 @@ The messaging gateway is the long-running process that connects Hermes to 20+ ex
 | File | Purpose |
 |------|---------|
 | `gateway/run.py` | `GatewayRunner` facade — composes the `gateway/run_*.py` sibling mixins (startup, adapters, inbound, turn, busy, goals, notifications, shutdown, …) and `gateway/slash_commands_*.py` handlers |
+| `gateway/run_turn_runner.py` + `run_turn_runner_stream.py` | `TurnRunner` creates per-turn stream consumers; inherited `TurnStreamMixin._wire_stream_callbacks` owns speech deltas, citation previews, and interim commentary |
+| `plugins/platforms/slack/adapter_native_stream.py` | `SlackNativeFinalizationMixin` owns `_try_finalize_stream`, `_commit_stream`, and `_replace_stream_chunks`; `SlackAdapter` inherits these methods and retains native draft/state ownership |
 | `gateway/session.py` | `SessionStore` — conversation persistence and session key construction |
 | `gateway/delivery.py` | Outbound message delivery to target platforms/channels |
 | `gateway/pairing.py` | DM pairing flow for user authorization |

@@ -1255,6 +1255,10 @@ def _normalize_codex_response(
     ``recover_leaked_tool_call=False`` is for callers with no continuation (aux): tool-call-shaped text is
     then kept as ordinary content and judged by the same phase/completion gates as any other answer."""
     response_status = _lower_or_none(getattr(response, "status", None))
+    from agent.retrieval_sources import extract_retrieval_sources, source_registry
+    captured_registry = _field(response, "retrieval_source_registry")
+    request_id = _field(captured_registry, "request_id") or _field(response, "_request_id") or uuid.uuid4().hex
+    registry = source_registry(extract_retrieval_sources(response), request_id=request_id)
     incomplete_reason = str(_field(getattr(response, "incomplete_details", None), "reason", "") or "").strip().lower()
     response_incomplete_content_filter = response_status == "incomplete" and incomplete_reason == "content_filter"
     output = getattr(response, "output", None)
@@ -1266,8 +1270,8 @@ def _normalize_codex_response(
             msg = "Codex response has empty output but output_text is present (%d chars); synthesizing output item."
             logger.debug(msg, len(out_text))
             content: List[Any] = [SimpleNamespace(type="output_text", text=out_text)]
-        elif response_incomplete_content_filter:
-            # Provider safety block, not a partial answer: finish content_filter, not incomplete.
+        elif response_incomplete_content_filter or registry:
+            # A safety block finishes content_filter; metadata alone stays incomplete.
             content = []
         else:
             raise RuntimeError("Responses API returned no output items")
@@ -1278,6 +1282,8 @@ def _normalize_codex_response(
         raise RuntimeError(_format_responses_error(getattr(response, "error", None), response_status))
     scan = _OutputScan(response_status)
     scan.scan(output, issuer_kind, issuer_model)
+    if registry:
+        scan.message_items_raw.append(registry)
     tool_calls, reasoning_parts = scan.tool_calls, scan.reasoning_parts
     final_text = "\n".join(scan.content_parts).strip()
     if not final_text and (scan.saw_final_answer_phase or not scan.saw_commentary_phase):
@@ -1316,7 +1322,7 @@ def _normalize_codex_response(
         reasoning_content=None, reasoning_details=None,
         codex_reasoning_items=scan.reasoning_items_raw or None,
         # Leaked text must not be replayed as a completed assistant message on the continuation.
-        codex_message_items=None if leaked_tool_call_text else (scan.message_items_raw or None),
+        codex_message_items=([registry] if registry else None) if leaked_tool_call_text else (scan.message_items_raw or None),
     )
     # Reasoning-only: for Codex/xAI/GitHub, status=completed means "still thinking" → incomplete so the continuation
     # retries. Other backends trust response.status — forcing incomplete there stalls for minutes on a final state.
@@ -1330,6 +1336,7 @@ def _normalize_codex_response(
         finish_reason = "content_filter"
     elif (
         leaked_tool_call_text
+        or (registry and not final_text and not reasoning_parts)
         or scan.saw_streaming_or_item_incomplete
         or ((scan.has_incomplete_items or scan.saw_commentary_phase) and not scan.saw_final_answer_phase)
         or (reasoning_only and not trusted_final)
@@ -1337,4 +1344,6 @@ def _normalize_codex_response(
         finish_reason = "incomplete"
     else:
         finish_reason = "stop"
+    from agent.retrieval_sources import log_retrieval_source_counts
+    log_retrieval_source_counts("normalize", assistant_message)
     return assistant_message, finish_reason

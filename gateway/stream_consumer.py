@@ -169,6 +169,7 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
         # (WeCom msgtype "stream"): the ONLY channel — any failure falls back to edit/send.
         self._use_draft_streaming = False
         self._draft_id: Optional[int] = None
+        self._authoritative_final_adopted = False
         self._draft_failures = 0
         # TERMINAL authorization refusal for THIS RUN (see _send_draft_frame).
         # Per-run state, constructed fresh each turn, so a refusal can never
@@ -253,7 +254,9 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
         progress = "\n".join(self._tool_progress_lines)
         return "\n\n---\n".join(p for p in (self._accumulated, progress) if p)
 
-    def _metadata_for_send(self, *, final: bool = False, expect_edits: bool = False) -> dict | None:
+    def _metadata_for_send(
+        self, *, final: bool = False, expect_edits: bool = False, is_turn_final: bool = False,
+    ) -> dict | None:
         """Per-send metadata.  ``final`` → notify=True (Mattermost treats notify-worthy sends
         as final when a broken thread root may fall back flat); ``expect_edits`` keeps
         editable previews on Telegram's legacy send path."""
@@ -264,7 +267,22 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
             meta["expect_edits"] = True
         if final:
             meta["notify"] = True
+        if final and is_turn_final:
+            hook = self._draft_final_hook(meta)
+            if hook is not None:
+                meta.update(hook(self.adapter, draft_id=self._draft_id))
         return meta or None
+
+    def _draft_final_hook(self, meta: dict) -> Any:
+        """Opt-in ownership for an unsplit authoritative final, never a partial chunk."""
+        if (self._authoritative_final_adopted and not self._turn_split_delivery
+                and self._use_draft_streaming and self._stream_is_message()
+                and not meta.get("_interim_send") and not meta.get("expect_edits")):
+            # A class probe cannot fabricate a capability on MagicMock adapters.
+            hook = getattr(type(self.adapter), "draft_final_metadata", None)
+            if callable(hook):
+                return hook
+        return None
 
     # Read-only views for the gateway (flag semantics: see _clear_turn_final_flags).
     already_sent = property(lambda self: self._already_sent)
@@ -298,7 +316,8 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
         ACKED on the wire, not ``_accumulated``: a throttled stream's last ack may be an
         older cursor-suffixed preview, which must not suppress the corrective send."""
         acked = self._last_sent_text or self._accumulated
-        if self.cfg.cursor and acked.endswith(self.cfg.cursor):
+        if (self._draft_final_hook(self.metadata or {}) is None
+                and self.cfg.cursor and acked.endswith(self.cfg.cursor)):
             acked = acked[: -len(self.cfg.cursor)]
         self._mark_final_delivered(record=acked)
 
@@ -570,6 +589,10 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
                     if _is_intentional_silence_response(self._clean_for_display(self._accumulated)):
                         await self._suppress_silence_marker()
                         return
+                    # An opted-in draft adapter owns the complete body's bounds;
+                    # even short raw text may expand into multiple formatted chunks.
+                    if self._message_id is None and await self._send_bounded_draft_final():
+                        return
 
                 if self._should_edit(tick) and (
                     self._accumulated or (self._use_native_streaming and self._tool_progress_active)
@@ -700,6 +723,7 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
             return
         if not self._turn_split_delivery:
             final_payload = self._clean_for_display(final_raw)
+            self._authoritative_final_adopted = bool(final_payload)
             if final_payload and final_payload != self._clean_for_display(self._accumulated):
                 self._accumulated = final_raw
                 self._stream_ledger = final_raw

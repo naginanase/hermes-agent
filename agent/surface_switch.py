@@ -27,6 +27,50 @@ _SURFACE_NAME_END = " — any earlier interface guidance"
 # scan is enough; without a bound every turn of a never-switched session walks the whole transcript.
 _NOTE_SCAN_TAIL = 200
 
+_SLACK_HINT_UPGRADE_NOTE_PREFIX = "[System: Slack formatting guidance upgrade v1"
+
+
+def stage_slack_hint_upgrade(agent: Any, prompt: str, conversation_history: Any) -> bool:
+    """Update continuing Slack sessions at the request tail, never the frozen prefix.
+
+    Uses the existing surface-note channel so string turns persist exact wire bytes
+    in ``api_content`` and multimodal turns carry a durable text part. The version
+    plus exact effective hint deduplicate across fresh gateway agents and honor
+    platform-hint overrides without rewriting any retained context.
+    """
+    if not conversation_history or str(getattr(agent, "platform", "") or "").lower().strip() != "slack":
+        return False
+    if getattr(agent, "provider", None) == "moa" or getattr(agent, "api_mode", None) == "codex_app_server":
+        return False
+    from agent.system_prompt import platform_hint
+
+    hint = platform_hint(agent)
+    if not hint or hint in prompt:
+        return False
+    note = (
+        f"{_SLACK_HINT_UPGRADE_NOTE_PREFIX}: earlier Slack formatting guidance is superseded; "
+        "follow the current guidance below for replies on Slack.]\n" + hint
+    )
+    # Unlike surface switches, this note is never re-stamped: it may be older
+    # than the bounded surface-note tail while still part of the cached request.
+    for msg in reversed(conversation_history):
+        if not isinstance(msg, dict) or msg.get("role") != "user":
+            continue
+        sidecar = msg.get("api_content")
+        text = (sidecar if isinstance(sidecar, str) else "") + "\n" + flatten_message_text(msg.get("content"))
+        if note in text:
+            return False
+    staged = getattr(agent, "_surface_switch_note", "") or ""
+    if note in staged:
+        return False
+    if hint in staged:
+        # A simultaneous surface switch already carries the guidance. Version
+        # that unpublished tail in place, not any historical message.
+        agent._surface_switch_note = staged.replace(hint, note, 1)
+    else:
+        agent._surface_switch_note = staged + "\n\n" + note if staged else note
+    return True
+
 
 def split_runtime_boundary(prompt: str) -> tuple:
     """``(identity, runtime_marker, runtime)`` of a persisted prompt.  Legacy prose may quote
@@ -125,6 +169,12 @@ def stage_surface_switch_note(agent: Any, prompt: str, conversation_history: Any
         return False
     from agent.system_prompt import platform_hint
     hint = platform_hint(agent) if described != current else ""
+    if not hint and current.lower() == "slack":
+        # Returning to Slack must not retire its compatibility update by
+        # pointing back at obsolete guidance in the frozen prompt.
+        slack_hint = platform_hint(agent)
+        if slack_hint and slack_hint not in prompt:
+            hint = slack_hint
     where = "the guidance below" if hint else "the interface section in the system prompt above"
     note = (
         f"{_SURFACE_SWITCH_NOTE_PREFIX}{current}{_SURFACE_NAME_END} in this conversation is "
